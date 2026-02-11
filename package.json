@@ -1,0 +1,26 @@
+{
+  "name": "back-end",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://oauth2: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@github.com/SynCode-CollaborativeCoding/back-end.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/SynCode-CollaborativeCoding/back-end/issues"
+  },
+  "homepage": "https://github.com/SynCode-CollaborativeCoding/back-end#readme",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "express-ws": "^5.0.2"
+  }
+}
