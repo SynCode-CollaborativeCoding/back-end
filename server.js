@@ -5,33 +5,85 @@ import cors from 'cors';
 const { app } = ExpressWs(express());
 const port = 3000;
 
-// Diccionario para guardar qué clientes están en qué sala
-const rooms = {}; 
-
 app.use(cors({ origin: '*' }));
+
+// Estructura: { roomId: [ { ws, id, username } ] }
+const rooms = {}; 
+let nextUserId = 1;
+
 app.ws('/room/:id', (ws, req) => {
     const roomId = req.params.id;
-    console.log(`Usuario conectado a la sala: ${roomId}`);
+    const userId = nextUserId++;
+    
+    // Inicializar sala si no existe
+    if (!rooms[roomId]) rooms[roomId] = [];
+    
+    const userContext = { ws, id: userId, username: 'Anonymous' };
+    rooms[roomId].push(userContext);
 
-    // Crear la sala si no existe
-    if (!rooms[roomId]) rooms[roomId] = new Set();
-    rooms[roomId].add(ws);
+    console.log(`User ${userId} joined room ${roomId}`);
 
-    ws.on('message', (msg) => {
-        // Reenviar el mensaje a todos los demás en la misma sala
-        rooms[roomId].forEach(client => {
-            if (client !== ws && client.readyState === 1) {
-                client.send(msg);
+    // Enviar ID propio al usuario
+    ws.send(JSON.stringify({
+        type: 'set-id',
+        id: userId
+    }));
+
+    // Notificar a los demás
+    broadcastToRoom(roomId, {
+        type: 'user-connected',
+        id: userId
+    }, userId);
+
+    ws.on('message', (msgStr) => {
+        try {
+            const msg = JSON.parse(msgStr);
+            
+            // Actualizar username si el cliente lo envía
+            if (msg.type === 'login') userContext.username = msg.username;
+
+            // History
+            if (msg.targetId) {
+                // Envío privado (Peer-to-peer)
+                const target = rooms[roomId].find(u => u.id === msg.targetId);
+                if (target && target.ws.readyState === 1) {
+                    target.ws.send(JSON.stringify({ ...msg, authorId: userId }));
+                }
+            } else {
+                // Broadcast a toda la sala
+                broadcastToRoom(roomId, { ...msg, authorId: userId }, userId);
             }
-        });
+        } catch (e) {
+            console.error("Error processing JSON:", e);
+        }
     });
 
     ws.on('close', () => {
-        rooms[roomId].delete(ws);
-        console.log(`Usuario salió de la sala: ${roomId}`);
+        // Eliminar usuario de la sala
+        rooms[roomId] = rooms[roomId].filter(u => u.ws !== ws);
+        console.log(`User ${userId} left room ${roomId}`);
+        
+        // Notificar logout
+        broadcastToRoom(roomId, {
+            type: 'user-disconnected',
+            id: userId
+        });
+
+        if (rooms[roomId].length === 0) delete rooms[roomId];
     });
 });
 
+// Función broadcast para reenviar a todos en la sala menos al autor
+function broadcastToRoom(roomId, data, excludeId = null) {
+    if (!rooms[roomId]) return;
+    const msg = JSON.stringify(data);
+    rooms[roomId].forEach(user => {
+        if (user.id !== excludeId && user.ws.readyState === 1) {
+            user.ws.send(msg);
+        }
+    });
+}
+
 app.listen(port, () => {
-    console.log(`Servidor SynCode corriendo en http://localhost:${port}`);
+    console.log(`Backend ready in http://localhost:${port}`);
 });
