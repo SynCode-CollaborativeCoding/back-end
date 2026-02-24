@@ -13,19 +13,28 @@ const SECRET_KEY = "syncode_secret";
 app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 
+// Middleware para logs de requests
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    next();
+});
+
 // Enpoints autenticación
 
 //1. Sign up
 app.post('/api/auth/register', async (req, res) => {
     const { username, password, avatar } = req.body;
+    console.log(`[REGISTER] Attempting registration for user: ${username}`);
     try {
         const passwordHash = md5(password); // Encriptación MD5
         const [result] = await db.execute(
             'INSERT INTO users (username, password_hash, avatar_url) VALUES (?, ?, ?)',
             [username, passwordHash, avatar]
         );
+        console.log(`[REGISTER] User created successfully: ${username}`);
         res.status(201).json({ message: "Usuario creado con éxito" });
     } catch (error) {
+        console.error(`[REGISTER] Error registering user ${username}:`, error.message);
         res.status(400).json({ error: "El usuario ya existe o hay un error en los datos" });
     }
 });
@@ -33,6 +42,7 @@ app.post('/api/auth/register', async (req, res) => {
 //2. Login
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
+    console.log(`[LOGIN] Attempting login for user: ${username}`);
     try {
         const passwordHash = md5(password);
         const [rows] = await db.execute(
@@ -48,11 +58,14 @@ app.post('/api/auth/login', async (req, res) => {
                 SECRET_KEY, 
                 { expiresIn: '24h' } // Expira en 24 horas
             );
+            console.log(`[LOGIN] User logged in successfully: ${username}`);
             res.json({ token, username: user.username, avatar: user.avatar_url });
         } else {
+            console.warn(`[LOGIN] Failed login attempt for user: ${username}`);
             res.status(401).json({ error: "Credenciales incorrectas" });
         }
     } catch (error) {
+        console.error(`[LOGIN] Server error:`, error.message);
         res.status(500).json({ error: "Error en el servidor" });
     }
 });
@@ -73,7 +86,7 @@ app.ws('/room/:id', (ws, req) => {
     const userContext = { ws, id: userId, username: 'Anonymous' };
     rooms[roomId].push(userContext);
 
-    console.log(`User ${userId} joined room ${roomId}`);
+    console.log(`[WS] User ${userId} joined room ${roomId}. Total users in room: ${rooms[roomId].length}`);
 
     // Enviar ID propio al usuario
     ws.send(JSON.stringify({
@@ -106,14 +119,14 @@ app.ws('/room/:id', (ws, req) => {
                 broadcastToRoom(roomId, { ...msg, authorId: userId }, userId);
             }
         } catch (e) {
-            console.error("Error processing JSON:", e);
+            console.error(`[WS] Error processing JSON from user ${userId}:`, e.message);
         }
     });
 
     ws.on('close', () => {
         // Eliminar usuario de la sala
         rooms[roomId] = rooms[roomId].filter(u => u.ws !== ws);
-        console.log(`User ${userId} left room ${roomId}`);
+        console.log(`[WS] User ${userId} (${userContext.username}) left room ${roomId}. Remaining users: ${rooms[roomId].length}`);
         
         // Notificar logout
         broadcastToRoom(roomId, {
@@ -121,7 +134,10 @@ app.ws('/room/:id', (ws, req) => {
             id: userId
         });
 
-        if (rooms[roomId].length === 0) delete rooms[roomId];
+        if (rooms[roomId].length === 0) {
+            delete rooms[roomId];
+            console.log(`[WS] Room ${roomId} deleted (no users remaining)`);
+        }
     });
 });
 
@@ -137,5 +153,5 @@ function broadcastToRoom(roomId, data, excludeId = null) {
 }
 
 app.listen(port, () => {
-    console.log(`Backend ready in http://localhost:${port}`);
+    console.log(`[SERVER] Backend ready in http://localhost:${port}`);
 });
