@@ -19,8 +19,12 @@
   },
   "homepage": "https://github.com/SynCode-CollaborativeCoding/back-end#readme",
   "dependencies": {
+    "blueimp-md5": "^2.19.0",
+    "body-parser": "^2.2.2",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "express-ws": "^5.0.2"
+    "express-ws": "^5.0.2",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.18.0"
   }
 }

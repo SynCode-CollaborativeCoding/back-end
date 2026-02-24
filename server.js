@@ -1,11 +1,63 @@
 import express from 'express';
 import ExpressWs from 'express-ws';
 import cors from 'cors';
+import bodyParser from 'body-parser';
+import md5 from 'blueimp-md5';
+import jwt from 'jsonwebtoken';
+import db from './db.js';      // Importamos la conexión a la base de datos
 
 const { app } = ExpressWs(express());
 const port = 3000;
+const SECRET_KEY = "syncode_secret";
 
 app.use(cors({ origin: '*' }));
+app.use(bodyParser.json());
+
+// Enpoints autenticación
+
+//1. Sign up
+app.post('/api/auth/register', async (req, res) => {
+    const { username, password, avatar } = req.body;
+    try {
+        const passwordHash = md5(password); // Encriptación MD5
+        const [result] = await db.execute(
+            'INSERT INTO users (username, password_hash, avatar_url) VALUES (?, ?, ?)',
+            [username, passwordHash, avatar]
+        );
+        res.status(201).json({ message: "Usuario creado con éxito" });
+    } catch (error) {
+        res.status(400).json({ error: "El usuario ya existe o hay un error en los datos" });
+    }
+});
+
+//2. Login
+app.post('/api/auth/login', async (req, res) => {
+    const { username, password } = req.body;
+    try {
+        const passwordHash = md5(password);
+        const [rows] = await db.execute(
+            'SELECT * FROM users WHERE username = ? AND password_hash = ?',
+            [username, passwordHash]
+        );
+
+        if (rows.length > 0) {
+            const user = rows[0];
+            // Crear Token JWT
+            const token = jwt.sign(
+                { id: user.id, username: user.username }, 
+                SECRET_KEY, 
+                { expiresIn: '24h' } // Expira en 24 horas
+            );
+            res.json({ token, username: user.username, avatar: user.avatar_url });
+        } else {
+            res.status(401).json({ error: "Credenciales incorrectas" });
+        }
+    } catch (error) {
+        res.status(500).json({ error: "Error en el servidor" });
+    }
+});
+
+// WebSocket
 
 // Estructura: { roomId: [ { ws, id, username } ] }
 const rooms = {}; 
