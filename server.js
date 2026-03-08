@@ -8,7 +8,6 @@ import db from './db.js';      // Importamos la conexión a la base de datos
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
 
-clearUsers(); // DEBUG: Limpiar usuarios al iniciar el servidor (para pruebas)
 dotenv.config();
 
 const { app } = ExpressWs(express());
