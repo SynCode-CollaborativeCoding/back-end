@@ -8,6 +8,7 @@ import db from './db.js';      // Importamos la conexión a la base de datos
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
 
+clearUsers(); // DEBUG: Limpiar usuarios al iniciar el servidor (para pruebas)
 dotenv.config();
 
 const { app } = ExpressWs(express());
@@ -105,6 +106,16 @@ app.ws('/room/:id', (ws, req) => {
         const userId = decoded.id;
         const username = decoded.username;
 
+        // Anti-duplicados
+        if (rooms[roomId]) {
+            const isAlreadyOnRoom = rooms[roomId].some(u => u.id === userId);
+            if (isAlreadyOnRoom) {
+                console.warn(`[WS] Rejected: User ${username} already in room ${roomId}`);
+                ws.close(4003, "Ya tienes una sesión abierta en esta sala");
+                return;
+            }
+        }
+        
         // Inicializar sala si no existe
         if (!rooms[roomId]) rooms[roomId] = [];
         
