@@ -6,6 +6,8 @@ import md5 from 'blueimp-md5';
 import jwt from 'jsonwebtoken';
 import db from './db.js';      // Importamos la conexión a la base de datos
 import dotenv from 'dotenv';
+import crypto from 'node:crypto';
+
 dotenv.config();
 
 const { app } = ExpressWs(express());
@@ -28,10 +30,12 @@ app.post('/api/auth/register', async (req, res) => {
     const { username, password, avatar } = req.body;
     console.log(`[REGISTER] Attempting registration for user: ${username}`);
     try {
-        const passwordHash = md5(password); // Encriptación MD5
+        const salt = crypto.randomBytes(16).toString('hex');
+        const passwordHash = md5(password + salt); // Encriptación MD5 con salt
+        const storedPassword = `${salt}$${passwordHash}`; // Guardamos salt y hash juntos
         const [result] = await db.execute(
             'INSERT INTO users (username, password_hash, avatar_url) VALUES (?, ?, ?)',
-            [username, passwordHash, avatar]
+            [username, storedPassword, avatar]
         );
         console.log(`[REGISTER] User created successfully: ${username}`);
         res.status(201).json({ message: "Usuario creado con éxito" });
@@ -45,27 +49,34 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     console.log(`[LOGIN] Attempting login for user: ${username}`);
+    
     try {
-        const passwordHash = md5(password);
         const [rows] = await db.execute(
-            'SELECT * FROM users WHERE username = ? AND password_hash = ?',
-            [username, passwordHash]
+            'SELECT * FROM users WHERE username = ?',
+            [username]
         );
 
         if (rows.length > 0) {
             const user = rows[0];
-            // Crear Token JWT
-            const token = jwt.sign(
-                { id: user.id, username: user.username }, 
-                SECRET_KEY, 
-                { expiresIn: '24h' } // Expira en 24 horas
-            );
-            console.log(`[LOGIN] User logged in successfully: ${username}`);
-            res.json({ token, username: user.username, avatar: user.avatar_url });
-        } else {
-            console.warn(`[LOGIN] Failed login attempt for user: ${username}`);
-            res.status(401).json({ error: "Credenciales incorrectas" });
+            const [salt, storedHash] = user.password_hash.split('$');
+            const loginHash = md5(password + salt);
+
+            if (loginHash === storedHash) {
+                // Crear Token JWT
+                const token = jwt.sign(
+                    { id: user.id, username: user.username }, 
+                    SECRET_KEY, 
+                    { expiresIn: '24h' }
+                );
+                
+                console.log(`[LOGIN] User logged in successfully: ${username}`);
+                return res.json({ token, username: user.username, avatar: user.avatar_url });
+            }
         }
+
+        console.warn(`[LOGIN] Failed login attempt for user: ${username}`);
+        res.status(401).json({ error: "Credenciales incorrectas" });
+
     } catch (error) {
         console.error(`[LOGIN] Server error:`, error.message);
         res.status(500).json({ error: "Error en el servidor" });
@@ -79,68 +90,84 @@ const rooms = {};
 let nextUserId = 1;
 
 app.ws('/room/:id', (ws, req) => {
+    const token = req.query.token;
     const roomId = req.params.id;
-    const userId = nextUserId++;
+
+    if (!token) {
+        console.warn(`[WS] Connection rejected for room ${roomId}: No token provided`);
+        ws.close(4001, "Token de autenticación requerido");
+        return;
+    }
     
-    // Inicializar sala si no existe
-    if (!rooms[roomId]) rooms[roomId] = [];
-    
-    const userContext = { ws, id: userId, username: 'Anonymous' };
-    rooms[roomId].push(userContext);
+    try {
+        const decoded = jwt.verify(token, SECRET_KEY);
 
-    console.log(`[WS] User ${userId} joined room ${roomId}. Total users in room: ${rooms[roomId].length}`);
+        const userId = decoded.id;
+        const username = decoded.username;
 
-    // Enviar ID propio al usuario
-    ws.send(JSON.stringify({
-        type: 'set-id',
-        id: userId
-    }));
-
-    // Notificar a los demás
-    broadcastToRoom(roomId, {
-        type: 'user-connected',
-        id: userId
-    }, userId);
-
-    ws.on('message', (msgStr) => {
-        try {
-            const msg = JSON.parse(msgStr);
-            
-            // Actualizar username si el cliente lo envía
-            if (msg.type === 'login') userContext.username = msg.username;
-
-            // History
-            if (msg.targetId) {
-                // Envío privado (Peer-to-peer)
-                const target = rooms[roomId].find(u => u.id === msg.targetId);
-                if (target && target.ws.readyState === 1) {
-                    target.ws.send(JSON.stringify({ ...msg, authorId: userId }));
-                }
-            } else {
-                // Broadcast a toda la sala
-                broadcastToRoom(roomId, { ...msg, authorId: userId }, userId);
-            }
-        } catch (e) {
-            console.error(`[WS] Error processing JSON from user ${userId}:`, e.message);
-        }
-    });
-
-    ws.on('close', () => {
-        // Eliminar usuario de la sala
-        rooms[roomId] = rooms[roomId].filter(u => u.ws !== ws);
-        console.log(`[WS] User ${userId} (${userContext.username}) left room ${roomId}. Remaining users: ${rooms[roomId].length}`);
+        // Inicializar sala si no existe
+        if (!rooms[roomId]) rooms[roomId] = [];
         
-        // Notificar logout
-        broadcastToRoom(roomId, {
-            type: 'user-disconnected',
+        const userContext = { ws, id: userId, username: username };
+        rooms[roomId].push(userContext);
+
+        console.log(`[WS] User ${username} (${userId}) verified and joined room ${roomId}`);
+
+        // Enviar ID propio al usuario
+        ws.send(JSON.stringify({
+            type: 'set-id',
             id: userId
+        }));
+
+        // Notificar a los demás
+        broadcastToRoom(roomId, {
+            type: 'user-connected',
+            id: userId
+        }, userId);
+
+        ws.on('message', (msgStr) => {
+            try {
+                const msg = JSON.parse(msgStr);
+                
+                // Actualizar username si el cliente lo envía
+                if (msg.type === 'login') userContext.username = msg.username;
+
+                // History
+                if (msg.targetId) {
+                    // Envío privado (Peer-to-peer)
+                    const target = rooms[roomId].find(u => u.id === msg.targetId);
+                    if (target && target.ws.readyState === 1) {
+                        target.ws.send(JSON.stringify({ ...msg, authorId: userId }));
+                    }
+                } else {
+                    // Broadcast a toda la sala
+                    broadcastToRoom(roomId, { ...msg, authorId: userId }, userId);
+                }
+            } catch (e) {
+                console.error(`[WS] Error processing JSON from user ${userId}:`, e.message);
+            }
         });
 
-        if (rooms[roomId].length === 0) {
-            delete rooms[roomId];
-            console.log(`[WS] Room ${roomId} deleted (no users remaining)`);
-        }
-    });
+        ws.on('close', () => {
+            // Eliminar usuario de la sala
+            rooms[roomId] = rooms[roomId].filter(u => u.ws !== ws);
+            console.log(`[WS] User ${userId} (${userContext.username}) left room ${roomId}. Remaining users: ${rooms[roomId].length}`);
+            
+            // Notificar logout
+            broadcastToRoom(roomId, {
+                type: 'user-disconnected',
+                id: userId
+            });
+
+            if (rooms[roomId].length === 0) {
+                delete rooms[roomId];
+                console.log(`[WS] Room ${roomId} deleted (no users remaining)`);
+            }
+        });
+    } catch (e) {
+        console.error(`[WS] Connection rejected for room ${roomId}: Invalid token. Error:`, e.message);
+        ws.close(4002, "Token inválido");
+    }
 });
 
 // Función broadcast para reenviar a todos en la sala menos al autor
@@ -157,3 +184,14 @@ function broadcastToRoom(roomId, data, excludeId = null) {
 app.listen(port, () => {
     console.log(`[SERVER] Backend ready in http://localhost:${port}`);
 });
+
+// DEBUG Functions
+// remove all users from database (for testing)
+export async function clearUsers() {
+    try {
+        await db.execute('DELETE FROM users');
+        console.log("[DEBUG] All users cleared from database");
+    } catch (error) {
+        console.error("[DEBUG] Error clearing users:", error.message);
+    }
+}
