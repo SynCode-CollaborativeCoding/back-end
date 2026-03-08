@@ -5,11 +5,13 @@ import bodyParser from 'body-parser';
 import md5 from 'blueimp-md5';
 import jwt from 'jsonwebtoken';
 import db from './db.js';      // Importamos la conexión a la base de datos
+import dotenv from 'dotenv';
+dotenv.config();
 
 const { app } = ExpressWs(express());
 const port = 3000;
-const SECRET_KEY = "syncode_secret";
-
+const SECRET_KEY = process.env.SECRET_KEY;
+console.log(`[SERVER] Starting backend with SECRET_KEY: ${SECRET_KEY ? '***' : 'NOT SET'}`);
 app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 
