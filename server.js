@@ -4,7 +4,7 @@ import cors from 'cors';
 import bodyParser from 'body-parser';
 import md5 from 'blueimp-md5';
 import jwt from 'jsonwebtoken';
-import db from './db.js';      // Importamos la conexión a la base de datos
+import db from './db.js';
 import dotenv from 'dotenv';
 import crypto from 'node:crypto';
 
@@ -12,196 +12,208 @@ dotenv.config();
 
 const { app } = ExpressWs(express());
 const port = 3000;
-const SECRET_KEY = process.env.SECRET_KEY;
-console.log(`[SERVER] Starting backend with SECRET_KEY: ${SECRET_KEY ? '***' : 'NOT SET'}`);
+const SECRET_KEY = process.env.SECRET_KEY || 'default_secret_key';
+const ROOM_DELETE_TIMEOUT = 1 * 60 * 1000; // 5 minutos de gracia para salas vacías
+
 app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 
-// Middleware para logs de requests
+// --- ESTRUCTURAS DE DATOS EN MEMORIA ---
+const rooms = {};        // { roomName: [ { ws, id, username } ] }
+const roomTimeouts = {}; // { roomName: timeoutObject }
+
+// --- MIDDLEWARES ---
+
+// Middleware para logs de sistema
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`);
     next();
 });
 
-// Enpoints autenticación
+// Middleware para validar el JWT en rutas API
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-//1. Sign up
+    if (!token) return res.status(401).json({ error: "No token provided" });
+
+    jwt.verify(token, SECRET_KEY, (err, user) => {
+        if (err) return res.status(403).json({ error: "Token invalid or expired" });
+        req.user = user;
+        next();
+    });
+};
+
+// --- ENDPOINTS DE AUTENTICACIÓN ---
+
 app.post('/api/auth/register', async (req, res) => {
     const { username, password, avatar } = req.body;
-    console.log(`[REGISTER] Attempting registration for user: ${username}`);
     try {
         const salt = crypto.randomBytes(16).toString('hex');
-        const passwordHash = md5(password + salt); // Encriptación MD5 con salt
-        const storedPassword = `${salt}$${passwordHash}`; // Guardamos salt y hash juntos
-        const [result] = await db.execute(
+        const passwordHash = md5(password + salt);
+        const storedPassword = `${salt}$${passwordHash}`;
+        
+        await db.execute(
             'INSERT INTO users (username, password_hash, avatar_url) VALUES (?, ?, ?)',
             [username, storedPassword, avatar]
         );
-        console.log(`[REGISTER] User created successfully: ${username}`);
         res.status(201).json({ message: "Usuario creado con éxito" });
     } catch (error) {
-        console.error(`[REGISTER] Error registering user ${username}:`, error.message);
         res.status(400).json({ error: "El usuario ya existe o hay un error en los datos" });
     }
 });
 
-//2. Login
 app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
-    console.log(`[LOGIN] Attempting login for user: ${username}`);
-    
     try {
-        const [rows] = await db.execute(
-            'SELECT * FROM users WHERE username = ?',
-            [username]
-        );
-
+        const [rows] = await db.execute('SELECT * FROM users WHERE username = ?', [username]);
         if (rows.length > 0) {
             const user = rows[0];
             const [salt, storedHash] = user.password_hash.split('$');
             const loginHash = md5(password + salt);
 
             if (loginHash === storedHash) {
-                // Crear Token JWT
                 const token = jwt.sign(
                     { id: user.id, username: user.username }, 
                     SECRET_KEY, 
                     { expiresIn: '24h' }
                 );
-                
-                console.log(`[LOGIN] User logged in successfully: ${username}`);
                 return res.json({ token, username: user.username, avatar: user.avatar_url });
             }
         }
-
-        console.warn(`[LOGIN] Failed login attempt for user: ${username}`);
         res.status(401).json({ error: "Credenciales incorrectas" });
-
     } catch (error) {
-        console.error(`[LOGIN] Server error:`, error.message);
         res.status(500).json({ error: "Error en el servidor" });
     }
 });
 
-// WebSocket
+// --- ENDPOINTS DE GESTIÓN DE SALAS ---
 
-// Estructura: { roomId: [ { ws, id, username } ] }
-const rooms = {}; 
-let nextUserId = 1;
-
-app.ws('/room/:id', (ws, req) => {
-    const token = req.query.token;
-    const roomId = req.params.id;
-
-    if (!token) {
-        console.warn(`[WS] Connection rejected for room ${roomId}: No token provided`);
-        ws.close(4001, "Token de autenticación requerido");
-        return;
-    }
-    
+app.get('/api/rooms', authenticateToken, async (req, res) => {
     try {
-        const decoded = jwt.verify(token, SECRET_KEY);
-
-        const userId = decoded.id;
-        const username = decoded.username;
-
-        // Anti-duplicados
-        if (rooms[roomId]) {
-            const isAlreadyOnRoom = rooms[roomId].some(u => u.id === userId);
-            if (isAlreadyOnRoom) {
-                console.warn(`[WS] Rejected: User ${username} already in room ${roomId}`);
-                ws.close(4003, "Ya tienes una sesión abierta en esta sala");
-                return;
-            }
-        }
-        
-        // Inicializar sala si no existe
-        if (!rooms[roomId]) rooms[roomId] = [];
-        
-        const userContext = { ws, id: userId, username: username };
-        rooms[roomId].push(userContext);
-
-        console.log(`[WS] User ${username} (${userId}) verified and joined room ${roomId}`);
-
-        // Enviar ID propio al usuario
-        ws.send(JSON.stringify({
-            type: 'set-id',
-            id: userId
-        }));
-
-        // Notificar a los demás
-        broadcastToRoom(roomId, {
-            type: 'user-connected',
-            id: userId
-        }, userId);
-
-        ws.on('message', (msgStr) => {
-            try {
-                const msg = JSON.parse(msgStr);
-                
-                // Actualizar username si el cliente lo envía
-                if (msg.type === 'login') userContext.username = msg.username;
-
-                // History
-                if (msg.targetId) {
-                    // Envío privado (Peer-to-peer)
-                    const target = rooms[roomId].find(u => u.id === msg.targetId);
-                    if (target && target.ws.readyState === 1) {
-                        target.ws.send(JSON.stringify({ ...msg, authorId: userId }));
-                    }
-                } else {
-                    // Broadcast a toda la sala
-                    broadcastToRoom(roomId, { ...msg, authorId: userId }, userId);
-                }
-            } catch (e) {
-                console.error(`[WS] Error processing JSON from user ${userId}:`, e.message);
-            }
-        });
-
-        ws.on('close', () => {
-            // Eliminar usuario de la sala
-            rooms[roomId] = rooms[roomId].filter(u => u.ws !== ws);
-            console.log(`[WS] User ${userId} (${userContext.username}) left room ${roomId}. Remaining users: ${rooms[roomId].length}`);
-            
-            // Notificar logout
-            broadcastToRoom(roomId, {
-                type: 'user-disconnected',
-                id: userId
-            });
-
-            if (rooms[roomId].length === 0) {
-                delete rooms[roomId];
-                console.log(`[WS] Room ${roomId} deleted (no users remaining)`);
-            }
-        });
-    } catch (e) {
-        console.error(`[WS] Connection rejected for room ${roomId}: Invalid token. Error:`, e.message);
-        ws.close(4002, "Token inválido");
+        const [rows] = await db.execute('SELECT * FROM rooms ORDER BY created_at DESC');
+        res.json(rows);
+    } catch (error) {
+        res.status(500).json({ error: "Error al obtener salas" });
     }
 });
 
-// Función broadcast para reenviar a todos en la sala menos al autor
+app.post('/api/rooms', authenticateToken, async (req, res) => {
+    const { room_name, description } = req.body;
+    if (!room_name) return res.status(400).json({ error: "El nombre es obligatorio" });
+
+    try {
+        await db.execute(
+            'INSERT INTO rooms (room_name, description) VALUES (?, ?)',
+            [room_name, description || "No description provided"]
+        );
+        res.status(201).json({ message: "Sala creada con éxito" });
+    } catch (error) {
+        if (error.code === 'ER_DUP_ENTRY') res.status(400).json({ error: "Ya existe esa sala" });
+        else res.status(500).json({ error: "Error al crear sala" });
+    }
+});
+
+// --- LÓGICA DE WEBSOCKETS (TIEMPO REAL) ---
+
+app.ws('/room/:id', (ws, req) => {
+    const token = req.query.token;
+    const roomName = req.params.id;
+
+    if (!token) return ws.close(4001, "Token requerido");
+
+    // Convertimos la lógica en una función autoejecutable asíncrona para usar await
+    (async () => {
+        try {
+            const decoded = jwt.verify(token, SECRET_KEY);
+            const userId = decoded.id;
+            const username = decoded.username;
+
+            // --- VALIDACIÓN CONTRA BASE DE DATOS ---
+            const [roomExists] = await db.execute(
+                'SELECT id FROM rooms WHERE room_name = ?', 
+                [roomName]
+            );
+
+            if (roomExists.length === 0) {
+                console.warn(`[WS] Rejection: User ${username} tried to join non-existent room: ${roomName}`);
+                return ws.close(4004, "La sala no existe en la base de datos");
+            }
+            // ----------------------------------------------
+
+            // 1. CANCELAR BORRADO SI HABÍA UN TIMEOUT ACTIVO
+            if (roomTimeouts[roomName]) {
+                console.log(`[CLEANUP] Deletion cancelled for room: ${roomName}`);
+                clearTimeout(roomTimeouts[roomName]);
+                delete roomTimeouts[roomName];
+            }
+
+            if (!rooms[roomName]) rooms[roomName] = [];
+            
+            // Anti-duplicados
+            if (rooms[roomName].some(u => u.id === userId)) {
+                return ws.close(4003, "Sesión duplicada");
+            }
+            
+            const userContext = { ws, id: userId, username: username };
+            rooms[roomName].push(userContext);
+
+            console.log(`[WS] ${username} joined ${roomName}. Online: ${rooms[roomName].length}`);
+
+            ws.send(JSON.stringify({ type: 'set-id', id: userId }));
+            broadcastToRoom(roomName, { type: 'user-connected', id: userId }, userId);
+
+            ws.on('message', (msgStr) => {
+                try {
+                    const msg = JSON.parse(msgStr);
+                    if (msg.targetId) {
+                        const target = rooms[roomName].find(u => u.id === msg.targetId);
+                        if (target?.ws.readyState === 1) target.ws.send(JSON.stringify({ ...msg, authorId: userId }));
+                    } else {
+                        broadcastToRoom(roomName, { ...msg, authorId: userId }, userId);
+                    }
+                } catch (e) { console.error("WS Error:", e.message); }
+            });
+
+            ws.on('close', () => {
+                if (rooms[roomName]) {
+                    rooms[roomName] = rooms[roomName].filter(u => u.ws !== ws);
+                    broadcastToRoom(roomName, { type: 'user-disconnected', id: userId });
+
+                    // 2. SISTEMA DE BORRADO AUTOMÁTICO TRAS INACTIVIDAD
+                    if (rooms[roomName].length === 0) {
+                        console.log(`[CLEANUP] Room ${roomName} empty. Scheduled deletion in ${ROOM_DELETE_TIMEOUT/60000}m.`);
+                        
+                        roomTimeouts[roomName] = setTimeout(async () => {
+                            try {
+                                await db.execute('DELETE FROM rooms WHERE room_name = ?', [roomName]);
+                                delete rooms[roomName];
+                                delete roomTimeouts[roomName];
+                                console.log(`[DB] Room "${roomName}" removed due to inactivity.`);
+                            } catch (err) {
+                                console.error(`[ERROR] Auto-delete failed for ${roomName}:`, err.message);
+                            }
+                        }, ROOM_DELETE_TIMEOUT);
+                    }
+                }
+            });
+
+        } catch (e) {
+            console.error("[WS] Auth Error:", e.message);
+            ws.close(4002, "Token inválido");
+        }
+    })();
+});
+
+// Función auxiliar para broadcast
 function broadcastToRoom(roomId, data, excludeId = null) {
     if (!rooms[roomId]) return;
     const msg = JSON.stringify(data);
-    rooms[roomId].forEach(user => {
-        if (user.id !== excludeId && user.ws.readyState === 1) {
-            user.ws.send(msg);
-        }
+    rooms[roomId].forEach(u => {
+        if (u.id !== excludeId && u.ws.readyState === 1) u.ws.send(msg);
     });
 }
 
 app.listen(port, () => {
-    console.log(`[SERVER] Backend ready in http://localhost:${port}`);
+    console.log(`[SERVER] SynCode Backend running on http://localhost:${port}`);
 });
-
-// DEBUG Functions
-// remove all users from database (for testing)
-export async function clearUsers() {
-    try {
-        await db.execute('DELETE FROM users');
-        console.log("[DEBUG] All users cleared from database");
-    } catch (error) {
-        console.error("[DEBUG] Error clearing users:", error.message);
-    }
-}
