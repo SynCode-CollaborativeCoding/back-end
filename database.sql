@@ -15,7 +15,9 @@ CREATE TABLE rooms (
     id INT AUTO_INCREMENT PRIMARY KEY,
     room_name VARCHAR(100) NOT NULL UNIQUE,
     description TEXT, -- Information about the room purpose or current ongoing project
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    actual_project_id INT NULL, -- Link to the current project being worked on in the room
+    FOREIGN KEY (actual_project_id) REFERENCES projects(id) ON DELETE SET NULL
 );
 
 -- 3. Projects (Actual code saved by users)
