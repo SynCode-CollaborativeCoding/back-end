@@ -95,16 +95,40 @@ app.get('/api/rooms', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ error: "Error" }); }
 });
 
+app.put('/api/rooms/:name/project', authenticateToken, async (req, res) => {
+    const { project_id } = req.body;
+    try {
+        const [roomData] = await db.execute('SELECT actual_project_id FROM rooms WHERE room_name = ?', [req.params.name]);
+        if (roomData.length === 0) return res.status(404).json({ error: "Room not found" });
+
+        // Verify user owns the project being linked
+        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [project_id]);
+        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
+            return res.status(403).json({ error: "No tienes permiso para linkear este proyecto" });
+        }
+
+        await db.execute('UPDATE rooms SET actual_project_id = ? WHERE room_name = ?', [project_id, req.params.name]);
+        log('ROOM', `Room "${req.params.name}" linked to project ${project_id} by ${req.user.username}`);
+        res.json({ message: "Proyecto vinculado" });
+    } catch (e) {
+        log('ERROR', `Room update failed: ${e.message}`);
+        res.status(500).json({ error: "Error" });
+    }
+});
+
 app.get('/api/rooms/:name/content', authenticateToken, async (req, res) => {
     try {
         const [rows] = await db.execute(`
-            SELECT p.last_content 
-            FROM rooms r 
-            JOIN projects p ON r.actual_project_id = p.id 
-            WHERE r.room_name = ?`, [req.params.name]);
-        
+            SELECT ch.content_snapshot
+            FROM rooms r
+            JOIN projects p ON r.actual_project_id = p.id
+            LEFT JOIN code_history ch ON p.id = ch.project_id
+            WHERE r.room_name = ?
+            ORDER BY ch.saved_at DESC
+            LIMIT 1`, [req.params.name]);
+
         log('ROOM', `Content requested for room: ${req.params.name} by ${req.user.username}`);
-        res.json({ content: rows.length > 0 ? rows[0].last_content : "" });
+        res.json({ content: rows.length > 0 ? rows[0].content_snapshot : "" });
     } catch (e) { res.status(500).json({ error: "Error al cargar contenido" }); }
 });
 
@@ -130,40 +154,185 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
     res.json(rows);
 });
 
+app.get('/api/projects/:id/info', authenticateToken, async (req, res) => {
+    try {
+        const [rows] = await db.execute('SELECT id, project_name FROM projects WHERE id = ?', [req.params.id]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: "Project not found" });
+        }
+        res.json(rows[0]);
+    } catch (e) {
+        log('ERROR', `Project info fetch failed: ${e.message}`);
+        res.status(500).json({ error: "Error" });
+    }
+});
+
 app.post('/api/projects', authenticateToken, async (req, res) => {
     const { project_name } = req.body;
     try {
-        const [result] = await db.execute('INSERT INTO projects (project_name, owner_id, last_content) VALUES (?, ?, ?)', 
-            [project_name, req.user.id, ""]);
+        const [result] = await db.execute('INSERT INTO projects (project_name, owner_id) VALUES (?, ?)',
+            [project_name, req.user.id]);
         log('PROJECT', `New project created: ${project_name} (ID: ${result.insertId})`);
         res.status(201).json({ id: result.insertId });
-    } catch (e) { 
+    } catch (e) {
         log('ERROR', `Project creation: ${e.message}`);
-        res.status(500).json({ error: "Error al crear proyecto" }); 
+        res.status(500).json({ error: "Error al crear proyecto" });
     }
 });
 
 app.post('/api/projects/save-current', authenticateToken, async (req, res) => {
-    const { room_name, content } = req.body;
+    const { room_name, content, version_label } = req.body;
     try {
         const [roomData] = await db.execute('SELECT actual_project_id FROM rooms WHERE room_name = ?', [room_name]);
         if (roomData.length === 0 || !roomData[0].actual_project_id) return res.status(400).json({ error: "No vinculado" });
-        
-        const [result] = await db.execute('UPDATE projects SET last_content = ? WHERE id = ? AND owner_id = ?', [content, roomData[0].actual_project_id, req.user.id]);
-        if (result.affectedRows === 0) {
-            log('PROJECT', `Save failed: No permission or project not found for room "${room_name}" by ${req.user.username}`);
+
+        const projectId = roomData[0].actual_project_id;
+
+        // Verify ownership
+        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [projectId]);
+        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
+            log('PROJECT', `Save failed: No permission for project ${projectId} by ${req.user.username}`);
             return res.status(403).json({ error: "No tienes permiso para guardar este proyecto" });
         }
-        
+
+        // Insert into code_history
+        await db.execute(
+            'INSERT INTO code_history (project_id, user_id, content_snapshot, version_label) VALUES (?, ?, ?, ?)',
+            [projectId, req.user.id, content, version_label || null]
+        );
+
+        // Update project's updated_at timestamp
+        await db.execute('UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [projectId]);
+
         log('PROJECT', `Saved content for room "${room_name}" by ${req.user.username}`);
         res.json({ message: "Guardado" });
-    } catch (e) { 
+    } catch (e) {
         log('ERROR', `Save failed: ${e.message}`);
-        res.status(500).json({ error: "Error" }); 
+        res.status(500).json({ error: "Error" });
     }
 });
 
-// --- WEBSOCKETS (P2P) ---
+app.delete('/api/projects/:id', authenticateToken, async (req, res) => {
+    try {
+        await db.execute('DELETE FROM projects WHERE id = ? AND owner_id = ?', [req.params.id, req.user.id]);
+        res.json({ message: "Project and all history deleted" });
+    } catch (e) { res.status(500).json({ error: "Error deleting project" }); }
+});
+
+// --- CODE HISTORY ENDPOINTS ---
+app.get('/api/projects/:id/history', authenticateToken, async (req, res) => {
+    try {
+        // Verify ownership
+        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [req.params.id]);
+        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
+            return res.status(403).json({ error: "No tienes permiso" });
+        }
+
+        const [history] = await db.execute(
+            `SELECT ch.id, ch.user_id, ch.content_snapshot, ch.version_label, ch.saved_at, u.username
+             FROM code_history ch
+             JOIN users u ON ch.user_id = u.id
+             WHERE ch.project_id = ?
+             ORDER BY ch.saved_at DESC`,
+            [req.params.id]
+        );
+
+        log('HISTORY', `History fetched for project ${req.params.id} by ${req.user.username}`);
+        res.json(history);
+    } catch (e) {
+        log('ERROR', `History fetch failed: ${e.message}`);
+        res.status(500).json({ error: "Error al cargar historial" });
+    }
+});
+
+app.get('/api/projects/:id/history/:historyId', authenticateToken, async (req, res) => {
+    try {
+        // Verify ownership
+        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [req.params.id]);
+        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
+            return res.status(403).json({ error: "No tienes permiso" });
+        }
+
+        const [versionData] = await db.execute(
+            `SELECT id, user_id, content_snapshot, version_label, saved_at
+             FROM code_history
+             WHERE id = ? AND project_id = ?`,
+            [req.params.historyId, req.params.id]
+        );
+
+        if (versionData.length === 0) {
+            return res.status(404).json({ error: "Versión no encontrada" });
+        }
+
+        log('HISTORY', `Version ${req.params.historyId} fetched by ${req.user.username}`);
+        res.json(versionData[0]);
+    } catch (e) {
+        log('ERROR', `Version fetch failed: ${e.message}`);
+        res.status(500).json({ error: "Error al cargar versión" });
+    }
+});
+
+app.post('/api/projects/:id/history/:historyId/restore', authenticateToken, async (req, res) => {
+    try {
+        // Verify ownership
+        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [req.params.id]);
+        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
+            return res.status(403).json({ error: "No tienes permiso" });
+        }
+
+        // Get the content from the specified version
+        const [versionData] = await db.execute(
+            'SELECT content_snapshot FROM code_history WHERE id = ? AND project_id = ?',
+            [req.params.historyId, req.params.id]
+        );
+
+        if (versionData.length === 0) {
+            return res.status(404).json({ error: "Versión no encontrada" });
+        }
+
+        // Create a new history entry with the restored content
+        await db.execute(
+            'INSERT INTO code_history (project_id, user_id, content_snapshot, version_label) VALUES (?, ?, ?, ?)',
+            [req.params.id, req.user.id, versionData[0].content_snapshot, `Restored from version ${req.params.historyId}`]
+        );
+
+        // Update project's updated_at timestamp
+        await db.execute('UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [req.params.id]);
+
+        log('HISTORY', `Version ${req.params.historyId} restored for project ${req.params.id} by ${req.user.username}`);
+        res.json({ message: "Versión restaurada" });
+    } catch (e) {
+        log('ERROR', `Restore failed: ${e.message}`);
+        res.status(500).json({ error: "Error al restaurar versión" });
+    }
+});
+
+app.delete('/api/projects/:id/history/:historyId', authenticateToken, async (req, res) => {
+    try {
+        // Verify ownership
+        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [req.params.id]);
+        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
+            return res.status(403).json({ error: "No tienes permiso" });
+        }
+
+        const [result] = await db.execute(
+            'DELETE FROM code_history WHERE id = ? AND project_id = ?',
+            [req.params.historyId, req.params.id]
+        );
+
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: "Versión no encontrada" });
+        }
+
+        log('HISTORY', `Version ${req.params.historyId} deleted from project ${req.params.id} by ${req.user.username}`);
+        res.json({ message: "Versión eliminada" });
+    } catch (e) {
+        log('ERROR', `Delete failed: ${e.message}`);
+        res.status(500).json({ error: "Error al eliminar versión" });
+    }
+});
+
+
 app.ws('/room/:id', (ws, req) => {
     const token = req.query.token;
     const roomName = req.params.id;
