@@ -101,10 +101,10 @@ app.put('/api/rooms/:name/project', authenticateToken, async (req, res) => {
         const [roomData] = await db.execute('SELECT actual_project_id FROM rooms WHERE room_name = ?', [req.params.name]);
         if (roomData.length === 0) return res.status(404).json({ error: "Room not found" });
 
-        // Verify user owns the project being linked
-        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [project_id]);
-        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
-            return res.status(403).json({ error: "No tienes permiso para linkear este proyecto" });
+        // Verify project exists (anyone can link it)
+        const [projectData] = await db.execute('SELECT id FROM projects WHERE id = ?', [project_id]);
+        if (projectData.length === 0) {
+            return res.status(404).json({ error: "Proyecto no encontrado" });
         }
 
         await db.execute('UPDATE rooms SET actual_project_id = ? WHERE room_name = ?', [project_id, req.params.name]);
@@ -188,11 +188,10 @@ app.post('/api/projects/save-current', authenticateToken, async (req, res) => {
 
         const projectId = roomData[0].actual_project_id;
 
-        // Verify ownership
-        const [projectData] = await db.execute('SELECT owner_id FROM projects WHERE id = ?', [projectId]);
-        if (projectData.length === 0 || projectData[0].owner_id !== req.user.id) {
-            log('PROJECT', `Save failed: No permission for project ${projectId} by ${req.user.username}`);
-            return res.status(403).json({ error: "No tienes permiso para guardar este proyecto" });
+        // Verify project exists (anyone can save)
+        const [projectData] = await db.execute('SELECT id FROM projects WHERE id = ?', [projectId]);
+        if (projectData.length === 0) {
+            return res.status(404).json({ error: "Proyecto no encontrado" });
         }
 
         // Insert into code_history
