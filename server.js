@@ -74,16 +74,16 @@ app.post('/api/auth/login', async (req, res) => {
             const user = rows[0];
             const [salt, storedHash] = user.password_hash.split('$');
             if (md5(password + salt) === storedHash) {
-                const token = jwt.sign({ id: user.id, username: user.username }, SECRET_KEY, { expiresIn: '24h' });
+                const token = jwt.sign({ id: user.id, username: user.username, avatar: user.avatar_url }, SECRET_KEY, { expiresIn: '24h' });
                 log('AUTH', `Login success: ${username}`);
                 return res.json({ token, username: user.username, avatar: user.avatar_url });
             }
         }
         log('AUTH', `Login failed: Invalid credentials for ${username}`);
         res.status(401).json({ error: "Credenciales incorrectas" });
-    } catch (e) { 
+    } catch (e) {
         log('ERROR', `Login server error: ${e.message}`);
-        res.status(500).json({ error: "Error de servidor" }); 
+        res.status(500).json({ error: "Error de servidor" });
     }
 });
 
@@ -372,7 +372,7 @@ app.ws('/room/:id', (ws, req) => {
             log('WS', `User "${decoded.username}" (ID: ${decoded.id}) connected to room "${roomName}"`);
 
             ws.send(JSON.stringify({ type: 'set-id', id: decoded.id }));
-            broadcastToRoom(roomName, { type: 'user-connected', id: decoded.id, username: decoded.username }, decoded.id);
+            broadcastToRoom(roomName, { type: 'user-connected', id: decoded.id, username: decoded.username, avatar: decoded.avatar }, decoded.id);
 
             ws.on('message', (msgStr) => {
                 try {
