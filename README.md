@@ -6,7 +6,7 @@ Este repositorio contiene la lógica del servidor y la gestión de base de datos
 
 - **Node.js**
 - **MySQL**
-- **NPM** (incluido con Node.js)
+- **NPM**
 
 ## Instalación
 
@@ -31,7 +31,7 @@ DB_PASSWORD=la_contraseña_de_mysql
 Para inicializar la base de datos con la estructura y datos de prueba necesarios, sigue estos pasos en tu cliente SQL:
 
 1. **Esquema:** Ejecuta el contenido de `database.sql` para crear la base de datos, las tablas y relaciones.
-2. **Datos Mock:** Ejecuta el contenido de `mockupData.sql` para cargar los datos de prueba iniciales.
+2. **Datos Mock:** Ejecuta el contenido de `mockupData.sql` para cargar los datos de prueba iniciales (opcional).
 
 ## Ejecución
 
